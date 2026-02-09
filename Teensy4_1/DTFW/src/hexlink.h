@@ -7,7 +7,8 @@
 #include <Arduino.h>
 
 #include "constants.h"
-#include "utils.h"  // rawPacket definition
+
+static constexpr uint16_t CRC_RESIDUE = 0x0000; // verify once; change if needed
 
 // Teensy-side packet builder mirroring Python hexlink.py (no RW byte).
 // All packets are 64 bytes: [0]=START, [1]=FROM, [2]=TO, [3]=SEQ,
@@ -130,3 +131,57 @@ private:
         dst[3] = (uint8_t)((v >> 24) & 0xFF);
     }
 };
+
+
+// Inline info logger that builds INFO packets and writes via Serial in one shot.
+inline void logInfof(const char* fmt, ...)
+{
+    if (!fmt) return;
+
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(nullptr, 0, fmt, args);
+    va_end(args);
+    if (len < 0) return;
+
+    const size_t total = static_cast<size_t>(len) + 1; // include NUL
+    char msg[total];
+    va_start(args, fmt);
+    vsnprintf(msg, total, fmt, args);
+    va_end(args);
+
+    constexpr size_t payloadBytes = 55; // bytes 6..60
+    const size_t numPackets = (total + payloadBytes - 1) / payloadBytes;
+
+    uint8_t out[numPackets * PACKET_SIZE];
+    size_t offset = 0;
+    static uint8_t seq_info = 0;
+
+    for (size_t i = 0; i < numPackets; ++i) {
+        uint8_t* p = out + i * PACKET_SIZE;
+        memset(p, 0, PACKET_SIZE);
+
+        p[0] = START_BYTE;
+        p[1] = MASTER_ID;
+        p[2] = PC_ID;
+        p[3] = seq_info++;
+        p[4] = MSG_ID_INFO;
+
+        size_t remaining = total - offset;
+        size_t chunk = (remaining < payloadBytes) ? remaining : payloadBytes;
+        bool more = (offset + chunk) < total;
+
+        p[5] = more ? 0x01 : 0x00;
+        memcpy(p + 6, msg + offset, chunk);
+
+        FastCRC16 crc16;
+        const uint16_t c = crc16.xmodem(p, 61);
+        p[61] = (c >> 8) & 0xFF;
+        p[62] = c & 0xFF;
+        p[63] = END_BYTE;
+
+        offset += chunk;
+    }
+
+    Serial.write(out, numPackets * PACKET_SIZE);
+}

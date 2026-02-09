@@ -12,6 +12,73 @@ from hexlink import Packet
 from constants import *
 
 
+# ---- Telemetry Payload Parsing ----
+# Matches STFW delf.h TelemetryPayload / AxisTelemetry structs (packed, little-endian)
+# AxisTelemetry: 23 bytes  |  TelemetryPayload: 51 bytes at packet[5:56]
+_AXIS_TELEM_FMT = "<BBffffbHBB"  # mode, flags, setpoint, theta, omega, tau, temp, rtt, txErr, timeouts
+_AXIS_TELEM_SIZE = struct.calcsize(_AXIS_TELEM_FMT)  # 23
+_PAYLOAD_HDR_FMT = "<IB"  # timestamp(u32), globalFlags(u8)
+_PAYLOAD_HDR_SIZE = struct.calcsize(_PAYLOAD_HDR_FMT)  # 5
+
+_CALIB_PHASE_NAMES = [
+    "IDLE",
+    "SEEK_SENSOR",
+    "FIND_EDGE_1",
+    "REVERSE_TO_SENSOR",
+    "FIND_EDGE_2",
+    "MOVE_TO_CENTER",
+    "COMPLETE",
+]
+
+
+def _parse_axis_flags(flags: int) -> dict:
+    return {
+        "armed": bool(flags & 0x01),
+        "calibrated": bool(flags & 0x02),
+        "calibrating": bool(flags & 0x04),
+        "hasError": bool(flags & 0x08),
+        "awaitingResponse": bool(flags & 0x10),
+        "calibPhase": _CALIB_PHASE_NAMES[min((flags >> 5) & 0x07, 6)],
+    }
+
+
+def parse_axis_telemetry(data: bytes) -> dict:
+    mode, flags, sp, theta, omega, tau, temp, rtt, txe, to = struct.unpack(_AXIS_TELEM_FMT, data[:_AXIS_TELEM_SIZE])
+    return {
+        "mode": "HIGH" if mode else "LOW",
+        "flags": _parse_axis_flags(flags),
+        "setpoint": sp,
+        "theta": theta,
+        "omega": omega,
+        "tau": tau,
+        "temperature": temp,
+        "rttMicros": rtt,
+        "txErrors": txe,
+        "timeouts": to,
+    }
+
+
+def parse_telemetry_payload(pkt: bytes) -> dict | None:
+    """Parse a MSGID_STATUS packet (64 bytes). Returns dict or None on failure."""
+    if len(pkt) != PACKET_SIZE or pkt[4] != MSGID_STATUS:
+        return None
+    payload = pkt[5:56]  # 51 bytes
+    if len(payload) < _PAYLOAD_HDR_SIZE + 2 * _AXIS_TELEM_SIZE:
+        return None
+    ts, gflags = struct.unpack(_PAYLOAD_HDR_FMT, payload[:_PAYLOAD_HDR_SIZE])
+    off = _PAYLOAD_HDR_SIZE
+    left = parse_axis_telemetry(payload[off : off + _AXIS_TELEM_SIZE])
+    off += _AXIS_TELEM_SIZE
+    right = parse_axis_telemetry(payload[off : off + _AXIS_TELEM_SIZE])
+    return {
+        "slaveId": pkt[1],
+        "timestamp": ts,
+        "globalError": bool(gflags & 0x01),
+        "left": left,
+        "right": right,
+    }
+
+
 def setup_logging(
     *,
     level: int = logging.INFO,
@@ -143,7 +210,34 @@ class Hexapod:
         elif msgid == MSGID_PONG:
             self.log.info("[recv] PONG")
         elif msgid == MSGID_STATUS:
-            self.log.info("[recv] STATUS packet")
+            telem = parse_telemetry_payload(pkt)
+            if telem:
+                L = telem["left"]
+                R = telem["right"]
+                self.log.info(
+                    "[recv] STATUS slave=%d t=%uus err=%s | "
+                    "L: θ=%.3f sp=%.3f ω=%.2f τ=%.2f %dC rtt=%dµs %s | "
+                    "R: θ=%.3f sp=%.3f ω=%.2f τ=%.2f %dC rtt=%dµs %s",
+                    telem["slaveId"],
+                    telem["timestamp"],
+                    telem["globalError"],
+                    L["theta"],
+                    L["setpoint"],
+                    L["omega"],
+                    L["tau"],
+                    L["temperature"],
+                    L["rttMicros"],
+                    L["flags"]["calibPhase"],
+                    R["theta"],
+                    R["setpoint"],
+                    R["omega"],
+                    R["tau"],
+                    R["temperature"],
+                    R["rttMicros"],
+                    R["flags"]["calibPhase"],
+                )
+            else:
+                self.log.warning("[recv] STATUS packet - parse failed")
         elif msgid == MSGID_INFO and len(pkt) >= 6:
             flags = pkt[5]
             text = pkt[6:61].split(b"\x00", 1)[0].decode(errors="replace")
