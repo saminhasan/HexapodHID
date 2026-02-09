@@ -114,6 +114,50 @@ def traj_to_bytes_le(trajectory) -> bytes:
     return bytes(b)
 
 
+import os
+from datetime import datetime
+
+
+class TelemetryRecorder:
+    """Writes raw 64-byte STATUS packets to a binary log file.
+    Start on PLAY, stop on STOP. Decode later with decode_log.py."""
+
+    def __init__(self, output_dir: str = "output"):
+        self.log = logging.getLogger("telem_recorder")
+        self.output_dir = output_dir
+        self._file = None
+        self._count = 0
+
+    @property
+    def recording(self) -> bool:
+        return self._file is not None
+
+    def start(self) -> None:
+        os.makedirs(self.output_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.output_dir, f"telem_{ts}.bin")
+        self._file = open(path, "wb")
+        self._count = 0
+        self.log.info("[recorder] started -> %s", path)
+
+    def write(self, raw_pkt: bytes) -> None:
+        f = self._file
+        if f and not f.closed:
+            try:
+                f.write(raw_pkt)
+                self._count += 1
+            except ValueError:
+                pass  # file closed between check and write
+
+    def stop(self) -> None:
+        f = self._file
+        self._file = None  # clear reference first so write() stops
+        if f:
+            f.close()
+            self.log.info("[recorder] stopped, %d packets saved", self._count)
+            self._count = 0
+
+
 class Hexapod:
     def __init__(self) -> None:
         self.log = logging.getLogger("hexapod")
@@ -126,6 +170,7 @@ class Hexapod:
 
         self.start_us = time.perf_counter_ns() // 1000
         self.packet = Packet()
+        self.recorder = TelemetryRecorder()
 
     def micros(self) -> int:
         return (time.perf_counter_ns() // 1000) - self.start_us
@@ -210,6 +255,8 @@ class Hexapod:
         elif msgid == MSGID_PONG:
             self.log.info("[recv] PONG")
         elif msgid == MSGID_STATUS:
+            if self.recorder.recording:
+                self.recorder.write(pkt)
             telem = parse_telemetry_payload(pkt)
             if telem:
                 L = telem["left"]
@@ -351,15 +398,18 @@ class Hexapod:
         self.sendData(self.packet.validate_trajectory(crc32=crc32, length=length))
 
     def play(self) -> None:
+        self.recorder.start()
         self.sendData(self.packet.play())
 
     def pause(self) -> None:
         self.sendData(self.packet.pause())
 
     def stop(self) -> None:
+        self.recorder.stop()
         self.sendData(self.packet.stop())
 
     def estop(self) -> None:
+        self.recorder.stop()
         self.sendData(self.packet.estop())
 
     def reset(self) -> None:
