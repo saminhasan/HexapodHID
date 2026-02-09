@@ -105,19 +105,52 @@ class Hexapod:
                     continue
 
                 self.byteBuffer.extend(data)
-
-                if b"\n" in self.byteBuffer:
-                    *lines, rem = self.byteBuffer.split(b"\n")
-                    for line in lines:
-                        if line:
-                            self.process_line(line)
-                    self.byteBuffer = bytearray(rem)
+                self._consume_packets()
 
         except Exception:
             self.log.exception("[run] listener crashed")
         finally:
             self.inLoop.clear()
             self.log.debug("[run] listener stopped")
+
+    def _consume_packets(self) -> None:
+        """Extract fixed-size packets from buffer and dispatch."""
+        while len(self.byteBuffer) >= PACKET_SIZE:
+            # Align to START_BYTE
+            if self.byteBuffer[0] != START_BYTE:
+                del self.byteBuffer[0]
+                continue
+
+            if len(self.byteBuffer) < PACKET_SIZE:
+                return
+
+            candidate = bytes(self.byteBuffer[:PACKET_SIZE])
+
+            if candidate[-1] != END_BYTE or not Packet.validate(candidate):
+                # Drop the start byte and try to realign
+                del self.byteBuffer[0]
+                continue
+
+            # Packet is valid; remove from buffer and process
+            del self.byteBuffer[:PACKET_SIZE]
+            self.process_packet(candidate)
+
+    def process_packet(self, pkt: bytes) -> None:
+        msgid = pkt[4]
+
+        if msgid == MSGID_PING:
+            self.log.info("[recv] PING")
+        elif msgid == MSGID_PONG:
+            self.log.info("[recv] PONG")
+        elif msgid == MSGID_STATUS:
+            self.log.info("[recv] STATUS packet")
+        elif msgid == MSGID_INFO and len(pkt) >= 6:
+            flags = pkt[5]
+            text = pkt[6:61].split(b"\x00", 1)[0].decode(errors="replace")
+            suffix = " (more)" if flags & 0x01 else ""
+            self.log.info("[recv][INFO]%s %s", suffix, text)
+        else:
+            self.log.debug("[recv] MSGID 0x%02X len=%d", msgid, len(pkt))
 
     def process_line(self, line: bytes) -> None:
         # Typical device output is ASCII; keep it robust
@@ -142,7 +175,7 @@ class Hexapod:
 
             dt = (time.perf_counter_ns() - t0) / 1e9
 
-            ok = (sent == len(data))
+            ok = sent == len(data)
             if sent > 64:
                 self.log.info(
                     "[send] Sent %d bytes in %.2f s (%.2f MB/s)%s",
@@ -208,17 +241,14 @@ class Hexapod:
 
             db = traj_to_bytes_le(trajectory)
             crc = zlib.crc32(db)
-            
+
             # Debug: print first row bytes and CRC
             self.log.info("[upload] First row bytes: %s", db[:24].hex().upper())
             self.log.info("[upload] Total bytes: %d, CRC32: 0x%08X", len(db), crc)
-            
+
             self.validate_trajectory(crc32=crc, length=len(trajectory))
 
             self.log.info("[upload] Uploaded %s (%d points)", filename, len(trajectory))
-
-        except Exception:
-            self.log.exception("[upload] Error loading %s", filename)
 
         except Exception:
             self.log.exception("[upload] Error loading %s", filename)
@@ -262,13 +292,6 @@ if __name__ == "__main__":
     time.sleep(10)
 
     hexapod.disconnect()
-
-
-
-
-
-
-
 
 
 # import time
@@ -404,7 +427,7 @@ if __name__ == "__main__":
 #     def enable(self) -> None:
 #         # print("[Hexapod.enable] : Enable command sent.")
 #         self.sendData(self.packet.enable())
-    
+
 #     def disable(self) -> None:
 #         self.sendData(self.packet.disable())
 
@@ -423,7 +446,7 @@ if __name__ == "__main__":
 #                 return
 #             trajectory = data.tolist()
 #             self.sendData(self.packet.upload(trajectory))
-#             db = traj_to_bytes_le(trajectory) 
+#             db = traj_to_bytes_le(trajectory)
 #             self.validate_trajectory(crc32=zlib.crc32(db), length=len(trajectory))
 #             print(f"[Hexapod.upload] : Uploaded trajectory from {filename} with {len(trajectory)} points.")
 #         except Exception as e:

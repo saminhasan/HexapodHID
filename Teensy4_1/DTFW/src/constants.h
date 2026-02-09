@@ -22,14 +22,9 @@
 #define MSGID_CALIBRATE 0x0E
 #define MSGID_STAGE 0x0F
 #define MSGID_PARK   0x10
+#define MSG_ID_INFO   0x11
 #define MSGID_VALIDATE 0x0C
 #define MSGID_STATUS  0xFF
-
-#define CMD_GET      ((uint8_t)'?')  // 63
-#define CMD_SET      ((uint8_t)'=')  // 61
-
-#define START_BYTE 0xFE
-#define END_BYTE 0xFF
 
 static constexpr uint16_t CRC_RESIDUE = 0x0000; // verify once; change if needed
 

@@ -5,9 +5,18 @@
 #include "SerialBuffer.h"
 #include "utils.h"
 #include "fro_t4.h"
+#include <USBHost_t36.h>
 volatile bool inISR = false;
 volatile bool newData = false;
 FRO_T4 fro;
+
+// USB host stack for three downstream RawHID slave Teensy devices.
+USBHost myusb;
+USBHub hub1(myusb);  // instantiate hubs as needed (powered hub recommended)
+USBHub hub2(myusb);
+RawHIDController hid1(myusb);
+RawHIDController hid2(myusb);
+RawHIDController hid3(myusb);
 
 DMAMEM uint8_t rbmem[8192] = {0}; // ring buffer memory (128KB = 2048 packets)
 // 16MB in external PSRAM: 699,050 rows, each row = 6 floats (24 bytes)
