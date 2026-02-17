@@ -1,8 +1,11 @@
 import struct
 import os
+import sys
+import threading
 import pandas as pd
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
 
 try:
     from tqdm import tqdm
@@ -108,20 +111,48 @@ def extract_axis_dfs(bin_path: str, verify_crc: bool = True):
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-root = tk.Tk()
-root.withdraw()
+ctk.set_appearance_mode("system")
+ctk.set_default_color_theme("blue")
+
+dialog_root = tk.Tk()
+dialog_root.withdraw()
 
 bin_path = filedialog.askopenfilename(
     title="Select log file",
     filetypes=[("Binary files", "*.bin"), ("All files", "*.*")],
+    parent=dialog_root,
 )
+dialog_root.destroy()
 
 if not bin_path:
     print("No file selected. Exiting.")
-    root.destroy()
     raise SystemExit(0)
 
 dfs = extract_axis_dfs(bin_path, verify_crc=False)
+app_closing = False
+
+def _on_export_done(out_path: str | None = None, error: str | None = None):
+    if app_closing or not root.winfo_exists():
+        return
+    save_btn.configure(state="normal", text="Save as Excel")
+    status_label.configure(text="")
+    if error is None:
+        messagebox.showinfo("Export complete", f"Saved Excel file:\n{out_path}", parent=root)
+    else:
+        messagebox.showerror("Export failed", f"Could not save Excel file:\n{error}", parent=root)
+
+def _export_worker(out_path: str):
+    try:
+        with pd.ExcelWriter(out_path) as writer:
+            for axis in range(1, 7):
+                df = dfs.get(axis)
+                if df is None:
+                    pd.DataFrame().to_excel(writer, sheet_name=f"Axis_{axis}", index=False)
+                else:
+                    df.to_excel(writer, sheet_name=f"Axis_{axis}", index=False)
+        root.after(0, lambda: _on_export_done(out_path=out_path))
+    except Exception as exc:
+        root.after(0, lambda: _on_export_done(error=str(exc)))
 
 def save_dfs_to_excel():
     default_name = f"{os.path.splitext(os.path.basename(bin_path))[0]}_axes.xlsx"
@@ -135,40 +166,43 @@ def save_dfs_to_excel():
     if not out_path:
         return
 
-    try:
-        with pd.ExcelWriter(out_path) as writer:
-            for axis in range(1, 7):
-                df = dfs.get(axis)
-                if df is None:
-                    pd.DataFrame().to_excel(writer, sheet_name=f"Axis_{axis}", index=False)
-                else:
-                    df.to_excel(writer, sheet_name=f"Axis_{axis}", index=False)
+    save_btn.configure(state="disabled", text="Exporting...")
+    status_label.configure(text="Exporting Excel in background...")
+    threading.Thread(target=_export_worker, args=(out_path,), daemon=True).start()
 
-        messagebox.showinfo("Export complete", f"Saved Excel file:\n{out_path}")
-    except Exception as exc:
-        messagebox.showerror("Export failed", f"Could not save Excel file:\n{exc}")
-
-root.deiconify()
+root = ctk.CTk()
 root.title(f"Axis Plots - {os.path.basename(bin_path)}")
 root.geometry("1280x720")
 
-controls = ttk.Frame(root)
-controls.pack(side="top", fill="x", padx=8, pady=8)
+def on_close():
+    global app_closing
+    app_closing = True
+    plt.close("all")
+    root.quit()
+    root.destroy()
 
-save_btn = ttk.Button(controls, text="Save as Excel", command=save_dfs_to_excel)
-save_btn.pack(side="left")
+root.protocol("WM_DELETE_WINDOW", on_close)
 
-notebook = ttk.Notebook(root)
-notebook.pack(fill="both", expand=True)
+tabview = ctk.CTkTabview(root)
+tabview.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+controls = ctk.CTkFrame(root)
+controls.pack(side="bottom", fill="x", padx=8, pady=(4, 8))
+
+save_btn = ctk.CTkButton(controls, text="Save as Excel", command=save_dfs_to_excel)
+save_btn.pack(side="left", padx=8, pady=8)
+
+status_label = ctk.CTkLabel(controls, text="")
+status_label.pack(side="left", padx=8, pady=8)
 
 for axis in range(1, 7):
     df = dfs.get(axis)
-
-    tab = ttk.Frame(notebook)
-    notebook.add(tab, text=f"Axis {axis}")
+    tab_name = f"Axis {axis}"
+    tabview.add(tab_name)
+    tab = tabview.tab(tab_name)
 
     if df is None or df.empty:
-        msg = ttk.Label(tab, text=f"No data for axis {axis}")
+        msg = ctk.CTkLabel(tab, text=f"No data for axis {axis}")
         msg.pack(padx=12, pady=12)
         continue
 
@@ -181,15 +215,19 @@ for axis in range(1, 7):
     ax.set_xlabel("time (s)")
     ax.set_ylabel("rad")
     ax.grid(True)
-    ax.legend()
+    ax.legend(loc='upper right')
 
-    toolbar_frame = ttk.Frame(tab)
+    plot_host = tk.Frame(tab)
+    plot_host.pack(side="top", fill="both", expand=True)
+
+    toolbar_frame = tk.Frame(plot_host)
     toolbar_frame.pack(side="top", fill="x")
 
-    canvas = FigureCanvasTkAgg(fig, master=tab)
+    canvas = FigureCanvasTkAgg(fig, master=plot_host)
     toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
     toolbar.update()
     canvas.draw()
     canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
 
 root.mainloop()
+sys.exit(0)
