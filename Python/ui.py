@@ -9,7 +9,7 @@ from numpy import deg2rad, float32, ones, clip
 
 WIDTH, HEIGHT = 800, 480
 
-# Teensy 4.1 typical VID/PID (example you showed). Add more PIDs if needed.
+# Teensy 4.1  VID/PID. Add more PIDs if needed.
 TEENSY_VID = 0x16C0
 TEENSY_PIDS = {0x0483}
 

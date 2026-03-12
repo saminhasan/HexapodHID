@@ -148,7 +148,7 @@ struct MotorState
 struct PDController
 {
     float kP = 5.0f;                // Proportional gain
-    float kD = 2.0f;                // Derivative gain
+    float kD = 1.0f;                // Derivative gain
     float velocityLimit = 1.0f;     // Max velocity command
     uint8_t mode = 0;               // Control mode identifier
     

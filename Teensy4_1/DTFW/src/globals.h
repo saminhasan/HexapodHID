@@ -109,9 +109,8 @@ bool hasData = false;
 // ============================================================================
 // Trajectory Playback State (owned by ISR, read by loop for status)
 // ============================================================================
-static volatile float    frRemainder = 0.0f;    // fractional index [0,1)
-static volatile uint32_t idx = 0;               // integer trajectory index
-static float  outPose[NUM_AXIS] = {};            // scratch buffer (ISR only)
+volatile float    frRemainder = 0.0f;    // fractional index [0,1)
+volatile uint32_t idx = 0;               // integer trajectory index
 
 // ============================================================================
 // ISR Communication
@@ -165,18 +164,14 @@ static constexpr float PARK_ANGLE = -1.0471975512f;  // -60° in radians
 // ============================================================================
 void timerISR()
 {
-    fro.tick();
 
     if (sysState != SystemState::PLAYING || !hasData)
         return;
 
     uint32_t n = trajectory.length();
     if (n == 0) return;
-
+    fro.tick();
     float feedRate = fro.getFeedrate();
-    if (feedRate <= 0.0f)
-        return;
-
     frRemainder += feedRate;
     if (frRemainder >= 1.0f)
     {
@@ -186,6 +181,7 @@ void timerISR()
 
     uint32_t idx1 = idx + 1;
     if (idx1 >= n) idx1 = 0;
+    float  outPose[NUM_AXIS] = {};            // scratch buffer (ISR only)
 
     lerp6(outPose, trajectory[idx], trajectory[idx1], frRemainder);
 
@@ -195,6 +191,7 @@ void timerISR()
     if (dev1) dev1.write(p.buffer, PACKET_SIZE);
     if (dev2) dev2.write(p.buffer, PACKET_SIZE);
     if (dev3) dev3.write(p.buffer, PACKET_SIZE);
+    Serial.write(p.buffer, PACKET_SIZE); // also send to PC for logging
 }
 
 // ============================================================================

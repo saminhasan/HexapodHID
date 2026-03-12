@@ -4,7 +4,7 @@ import numpy as np
 from more_itertools import chunked
 from constants import *
 
-""" Packet structure (RW byte removed):
+""" Packet structure:
 [0]     : START_BYTE
 [1]     : FROM_ID
 [2]     : TO_ID
