@@ -1,184 +1,339 @@
-"""
-Decode and plot telemetry binary logs produced by TelemetryRecorder.
+from __future__ import annotations
 
-Usage:
-    python decode_log.py                         # opens latest .bin in output/
-    python decode_log.py output/telem_xxx.bin     # specific file
-
-Each record is a raw 64-byte STATUS packet.
-Payload layout (bytes 5..55, 51 bytes):
-    [0..3]   uint32  timestamp (µs)
-    [4]      uint8   globalFlags (bit0 = globalError)
-    [5..27]  AxisTelemetry LEFT  (23 bytes)
-    [28..50] AxisTelemetry RIGHT (23 bytes)
-
-AxisTelemetry (23 bytes, packed little-endian):
-    mode      uint8   (0=LOW, 1=HIGH)
-    flags     uint8
-    setpoint  float32
-    theta     float32
-    omega     float32
-    tau       float32
-    temp      int8
-    rtt       uint16
-    txErr     uint8
-    timeouts  uint8
-"""
-
-import sys
 import os
-import glob
+import sys
 import struct
-import numpy as np
+import threading
+import pandas as pd
+import tkinter as tk
+from tqdm import tqdm
+import customtkinter as ctk
+from dataclasses import dataclass
 import matplotlib.pyplot as plt
+from typing import Dict, List, Optional, Tuple
+from tkinter import filedialog, messagebox
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends._backend_tk import NavigationToolbar2Tk
 
-PACKET_SIZE = 64
+
+
+START_BYTE = 0xFE
+END_BYTE = 0xFF
+PKT_LEN = 64
+MSGID_JOG = 0x0B
 MSGID_STATUS = 0xFF
 
-# Struct formats (little-endian)
-_HDR_FMT = "<IB"  # timestamp(u32), globalFlags(u8)  = 5 bytes
-_AXIS_FMT = "<BBffffbHBB"  # 23 bytes per axis
-_HDR_SIZE = struct.calcsize(_HDR_FMT)
-_AXIS_SIZE = struct.calcsize(_AXIS_FMT)
 
-# Slave names for the 6 axes
-AXIS_LABELS = [
-    "S1-L",
-    "S1-R",
-    "S2-L",
-    "S2-R",
-    "S3-L",
-    "S3-R",
-]
+@dataclass(frozen=True)
+class PacketLayout:
+    axis1_offset: int = 10
+    axis2_offset: int = 33
 
 
-def decode_file(path: str) -> dict:
-    """Read binary log and return dict of numpy arrays keyed by field name."""
-    data = open(path, "rb").read()
-    n_packets = len(data) // PACKET_SIZE
-    if n_packets == 0:
-        print(f"Empty log: {path}")
-        sys.exit(1)
+def crc16_xmodem(data: bytes, init: int = 0x0000) -> int:
+    crc = init
+    for byte in data:
+        crc ^= (byte << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
 
-    print(f"Decoding {path}: {n_packets} packets, {len(data)} bytes")
 
-    # Pre-allocate arrays
-    timestamps = np.zeros(n_packets, dtype=np.float64)  # seconds
-    slave_ids = np.zeros(n_packets, dtype=np.uint8)
-
-    # Per-axis arrays: [n_packets] each
-    fields = ["setpoint", "theta", "omega", "tau", "temperature", "rtt"]
-    # Store per side: left and right
-    left = {f: np.zeros(n_packets, dtype=np.float64) for f in fields}
-    right = {f: np.zeros(n_packets, dtype=np.float64) for f in fields}
-
-    for i in range(n_packets):
-        pkt = data[i * PACKET_SIZE : (i + 1) * PACKET_SIZE]
-        if pkt[4] != MSGID_STATUS:
-            continue
-
-        slave_ids[i] = pkt[1]
-        payload = pkt[5:56]
-
-        ts, _gflags = struct.unpack(_HDR_FMT, payload[:_HDR_SIZE])
-        timestamps[i] = ts / 1e6  # µs → seconds
-
-        # Left axis
-        off = _HDR_SIZE
-        _mode, _flags, sp, theta, omega, tau, temp, rtt, _txe, _to = struct.unpack(_AXIS_FMT, payload[off : off + _AXIS_SIZE])
-        left["setpoint"][i] = sp
-        left["theta"][i] = theta
-        left["omega"][i] = omega
-        left["tau"][i] = tau
-        left["temperature"][i] = temp
-        left["rtt"][i] = rtt
-
-        # Right axis
-        off += _AXIS_SIZE
-        _mode, _flags, sp, theta, omega, tau, temp, rtt, _txe, _to = struct.unpack(_AXIS_FMT, payload[off : off + _AXIS_SIZE])
-        right["setpoint"][i] = sp
-        right["theta"][i] = theta
-        right["omega"][i] = omega
-        right["tau"][i] = tau
-        right["temperature"][i] = temp
-        right["rtt"][i] = rtt
+def parse_axis(buf: bytes, offset: int) -> Dict[str, float | int]:
+    mode = buf[offset + 0]
+    flags = buf[offset + 1]
+    setpoint, theta, omega, tau = struct.unpack_from("<ffff", buf, offset + 2)
+    temp = struct.unpack_from("<b", buf, offset + 18)[0]
+    rtt = struct.unpack_from("<H", buf, offset + 19)[0]
+    tx_err = buf[offset + 21]
+    timeouts = buf[offset + 22]
 
     return {
-        "timestamps": timestamps,
-        "slave_ids": slave_ids,
-        "left": left,
-        "right": right,
-        "n_packets": n_packets,
+        "mode": mode,
+        "flags": flags,
+        "setpoint": setpoint,
+        "theta": theta,
+        "omega": omega,
+        "tau": tau,
+        "temp": temp,
+        "rtt": rtt,
+        "txErr": tx_err,
+        "timeouts": timeouts,
     }
 
 
-def plot_telemetry(decoded: dict, title: str = "") -> None:
-    """Plot all telemetry data, grouped by slave and axis."""
-    ts = decoded["timestamps"]
-    sids = decoded["slave_ids"]
-    left = decoded["left"]
-    right = decoded["right"]
+def extract_axis_dfs(bin_path: str, verify_crc: bool = True) -> Tuple[Dict[int, pd.DataFrame], pd.DataFrame]:
+    with open(bin_path, "rb") as file:
+        data = file.read()
 
-    slaves = sorted(set(sids) - {0})  # exclude any zeros
-    if not slaves:
-        print("No valid slave packets found.")
-        return
+    rows_by_axis: Dict[int, List[dict]] = {}
+    jog_rows: List[dict] = []
+    layout = PacketLayout()
 
-    # Relative time from first packet
-    t0 = ts[ts > 0].min() if np.any(ts > 0) else 0
-    t_rel = ts - t0
+    total_bytes = len(data)
+    scan_limit = total_bytes - PKT_LEN + 1
+    skip_until = 0
 
-    plot_fields = [
-        ("theta", "Position (rad)", "setpoint"),
-        ("omega", "Velocity (rad/s)", None),
-        ("tau", "Torque (Nm)", None),
-        ("temperature", "Temperature (°C)", None),
-    ]
+    for index in tqdm(range(max(scan_limit, 0)), desc="Parsing packets", unit="byte"):
+        if index < skip_until:
+            continue
+        if data[index] != START_BYTE:
+            continue
+        if data[index + 63] != END_BYTE:
+            continue
 
-    fig, axes = plt.subplots(len(plot_fields), 1, figsize=(14, 3 * len(plot_fields)), sharex=True)
-    fig.suptitle(title or "Telemetry Log", fontsize=14, fontweight="bold")
+        packet = data[index:index + PKT_LEN]
 
-    colors = {1: ("#1f77b4", "#aec7e8"), 2: ("#2ca02c", "#98df8a"), 3: ("#d62728", "#ff9896")}
+        if verify_crc:
+            expected_crc = struct.unpack_from("<H", packet, 61)[0]
+            actual_crc = crc16_xmodem(packet[0:61])
+            if actual_crc != expected_crc:
+                continue
 
-    for ax, (field, ylabel, overlay) in zip(axes, plot_fields):
-        for sid in slaves:
-            mask = sids == sid
-            t = t_rel[mask]
-            c1, c2 = colors.get(sid, ("#333", "#999"))
+        from_id = packet[1]
+        to_id = packet[2]
+        seq = packet[3]
+        msgid = packet[4]
+        if msgid == MSGID_STATUS:
+            timestamp_us = struct.unpack_from("<I", packet, 5)[0]
+            resflag = packet[9]
 
-            ax.plot(t, left[field][mask], color=c1, linewidth=0.5, label=f"S{sid}-L", alpha=0.8)
-            ax.plot(t, right[field][mask], color=c2, linewidth=0.5, label=f"S{sid}-R", alpha=0.8)
+            axis1_no = 2 * from_id - 1
+            axis2_no = 2 * from_id
 
-            if overlay and overlay in left:
-                ax.plot(t, left[overlay][mask], color=c1, linewidth=0.5, linestyle="--", alpha=0.4)
-                ax.plot(t, right[overlay][mask], color=c2, linewidth=0.5, linestyle="--", alpha=0.4)
+            common = {
+                "from_id": from_id,
+                "to_id": to_id,
+                "seq": seq,
+                "msgid": msgid,
+                "timestamp_us": timestamp_us,
+                "resflag": resflag,
+            }
 
-        ax.set_ylabel(ylabel)
-        ax.legend(loc="upper right", fontsize=7, ncol=len(slaves) * 2)
-        ax.grid(True, alpha=0.3)
+            axis1 = parse_axis(packet, layout.axis1_offset)
+            axis2 = parse_axis(packet, layout.axis2_offset)
 
-    axes[-1].set_xlabel("Time (s)")
-    plt.tight_layout()
-    plt.show()
+            axis1_row = common.copy()
+            axis1_row["axis_no"] = axis1_no
+            axis1_row.update(axis1)
+            rows_by_axis.setdefault(axis1_no, []).append(axis1_row)
+
+            axis2_row = common.copy()
+            axis2_row["axis_no"] = axis2_no
+            axis2_row.update(axis2)
+            rows_by_axis.setdefault(axis2_no, []).append(axis2_row)
+        elif msgid == MSGID_JOG:
+            j1, j2, j3, j4, j5, j6 = struct.unpack_from("<6f", packet, 5)
+            jog_rows.append(
+                {
+                    "packet_index": index,
+                    "from_id": from_id,
+                    "to_id": to_id,
+                    "seq": seq,
+                    "msgid": msgid,
+                    "j1": j1,
+                    "j2": j2,
+                    "j3": j3,
+                    "j4": j4,
+                    "j5": j5,
+                    "j6": j6,
+                }
+            )
+
+        skip_until = index + PKT_LEN
+
+    dfs = {axis: pd.DataFrame(rows) for axis, rows in rows_by_axis.items()}
+
+    for axis, df in dfs.items():
+        if not df.empty:
+            dfs[axis] = df.sort_values(["timestamp_us", "seq"], kind="stable").reset_index(drop=True)
+
+    jog_df = pd.DataFrame(jog_rows)
+    if not jog_df.empty:
+        jog_df = jog_df.sort_values(["packet_index", "seq"], kind="stable").reset_index(drop=True)
+
+    return dfs, jog_df
 
 
-def find_latest_log(directory: str = "output") -> str | None:
-    """Find the most recent .bin file in the output directory."""
-    pattern = os.path.join(directory, "telem_*.bin")
-    files = glob.glob(pattern)
-    if not files:
-        return None
-    return max(files, key=os.path.getmtime)
+def prompt_for_bin_file() -> Optional[str]:
+    dialog_root = tk.Tk()
+    dialog_root.withdraw()
+
+    file_path = filedialog.askopenfilename(
+        title="Select log file",
+        filetypes=[("Binary files", "*.bin"), ("All files", "*.*")],
+        parent=dialog_root,
+    )
+
+    dialog_root.destroy()
+    return file_path or None
+
+
+class LogDecoderApp:
+    def __init__(self, bin_path: str, dfs: Dict[int, pd.DataFrame], jog_df: pd.DataFrame) -> None:
+        self.bin_path = bin_path
+        self.dfs = dfs
+        self.jog_df = jog_df
+        self.app_closing = False
+
+        ctk.set_appearance_mode("system")
+        ctk.set_default_color_theme("blue")
+
+        self.root = ctk.CTk()
+        self.root.title(f"Axis Plots - {os.path.basename(self.bin_path)}")
+        self.root.geometry("1280x720")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.tabview = ctk.CTkTabview(self.root)
+        self.tabview.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+        controls = ctk.CTkFrame(self.root)
+        controls.pack(side="bottom", fill="x", padx=8, pady=(4, 8))
+
+        self.save_btn = ctk.CTkButton(controls, text="Save as Excel", command=self.save_dfs_to_excel)
+        self.save_btn.pack(side="left", padx=8, pady=8)
+
+        self.status_label = ctk.CTkLabel(controls, text="")
+        self.status_label.pack(side="left", padx=8, pady=8)
+
+        self.build_axis_tabs()
+        self.build_jog_tab()
+
+    def on_close(self) -> None:
+        self.app_closing = True
+        plt.close("all")
+        self.root.quit()
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    def build_axis_tabs(self) -> None:
+        for axis in range(1, 7):
+            df = self.dfs.get(axis)
+            tab_name = f"Axis {axis}"
+            self.tabview.add(tab_name)
+            tab = self.tabview.tab(tab_name)
+
+            if df is None or df.empty:
+                msg = ctk.CTkLabel(tab, text=f"No data for axis {axis}")
+                msg.pack(padx=12, pady=12)
+                continue
+
+            time_s = df["timestamp_us"].to_numpy(dtype="float64") * 1e-6
+
+            fig, axis_plot = plt.subplots()
+            axis_plot.plot(time_s, df["setpoint"].to_numpy(), label="setpoint")
+            axis_plot.plot(time_s, df["theta"].to_numpy(), label="theta")
+            axis_plot.set_title(f"Axis {axis}: setpoint & theta vs time")
+            axis_plot.set_xlabel("time (s)")
+            axis_plot.set_ylabel("rad")
+            axis_plot.grid(True)
+            axis_plot.legend(loc="upper right")
+
+            plot_host = tk.Frame(tab)
+            plot_host.pack(side="top", fill="both", expand=True)
+
+            toolbar_frame = tk.Frame(plot_host)
+            toolbar_frame.pack(side="top", fill="x")
+
+            canvas = FigureCanvasTkAgg(fig, master=plot_host)
+            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+            toolbar.update()
+            canvas.draw()
+            canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+    def build_jog_tab(self) -> None:
+        tab_name = "JOG"
+        self.tabview.add(tab_name)
+        tab = self.tabview.tab(tab_name)
+
+        if self.jog_df.empty:
+            msg = ctk.CTkLabel(tab, text="No JOG packets found")
+            msg.pack(padx=12, pady=12)
+            return
+
+        x = self.jog_df["packet_index"].to_numpy(dtype="float64")
+
+        fig, jog_plot = plt.subplots()
+        for i in range(1, 7):
+            jog_plot.plot(x, self.jog_df[f"j{i}"].to_numpy(dtype="float64"), label=f"j{i}")
+        jog_plot.set_title("JOG payload (6 floats) vs packet index")
+        jog_plot.set_xlabel("packet index")
+        jog_plot.set_ylabel("command")
+        jog_plot.grid(True)
+        jog_plot.legend(loc="upper right")
+
+        plot_host = tk.Frame(tab)
+        plot_host.pack(side="top", fill="both", expand=True)
+
+        toolbar_frame = tk.Frame(plot_host)
+        toolbar_frame.pack(side="top", fill="x")
+
+        canvas = FigureCanvasTkAgg(fig, master=plot_host)
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+        canvas.draw()
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+    def _on_export_done(self, out_path: Optional[str] = None, error: Optional[str] = None) -> None:
+        if self.app_closing or not self.root.winfo_exists():
+            return
+
+        self.save_btn.configure(state="normal", text="Save as Excel")
+        self.status_label.configure(text="")
+
+        if error is None:
+            messagebox.showinfo("Export complete", f"Saved Excel file:\n{out_path}", parent=self.root)
+        else:
+            messagebox.showerror("Export failed", f"Could not save Excel file:\n{error}", parent=self.root)
+
+    def _export_worker(self, out_path: str) -> None:
+        try:
+            with pd.ExcelWriter(out_path) as writer:
+                for axis in range(1, 7):
+                    df = self.dfs.get(axis)
+                    if df is None:
+                        pd.DataFrame().to_excel(writer, sheet_name=f"Axis_{axis}", index=False)
+                    else:
+                        df.to_excel(writer, sheet_name=f"Axis_{axis}", index=False)
+                self.jog_df.to_excel(writer, sheet_name="JOG", index=False)
+            self.root.after(0, lambda: self._on_export_done(out_path=out_path))
+        except Exception as exc:
+            self.root.after(0, lambda: self._on_export_done(error=str(exc)))
+
+    def save_dfs_to_excel(self) -> None:
+        default_name = f"{os.path.splitext(os.path.basename(self.bin_path))[0]}_axes.xlsx"
+        out_path = filedialog.asksaveasfilename(
+            title="Save Excel file",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel Workbook", "*.xlsx")],
+        )
+
+        if not out_path:
+            return
+
+        self.save_btn.configure(state="disabled", text="Exporting...")
+        self.status_label.configure(text="Exporting Excel in background...")
+
+        threading.Thread(target=self._export_worker, args=(out_path,), daemon=True).start()
+
+
+def main() -> int:
+    bin_path = prompt_for_bin_file()
+    if not bin_path:
+        print("No file selected. Exiting.")
+        return 0
+
+    dfs, jog_df = extract_axis_dfs(bin_path, verify_crc=False)
+    app = LogDecoderApp(bin_path=bin_path, dfs=dfs, jog_df=jog_df)
+    app.run()
+    return 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        filepath = sys.argv[1]
-    else:
-        filepath = find_latest_log()
-        if not filepath:
-            print("No .bin files found in output/. Pass a path as argument.")
-            sys.exit(1)
-
-    decoded = decode_file(filepath)
-    plot_telemetry(decoded, title=os.path.basename(filepath))
+    sys.exit(main())
